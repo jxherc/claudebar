@@ -548,6 +548,30 @@ class UsageManager: ObservableObject {
         NSLog("ClaudeUsage: Cookie cleared, data reset")
     }
 
+    private var loginWindow: ClaudeLoginWindow?
+
+    func logIn() {
+        delegate?.closePopover()
+        if let w = loginWindow {
+            w.show()
+            return
+        }
+        loginWindow = ClaudeLoginWindow { [weak self] cookie in
+            DispatchQueue.main.async {
+                self?.loginWindow = nil
+                guard let cookie = cookie else { return }
+                self?.saveSessionCookie(cookie)
+                self?.fetchUsage()
+            }
+        }
+        loginWindow?.show()
+    }
+
+    func logOut() {
+        clearSessionCookie()
+        ClaudeLoginWindow.clearWebData()
+    }
+
     func fetchOrganizationId(completion: @escaping (String?) -> Void) {
         // Get org ID from the lastActiveOrg cookie value
         let cookieParts = sessionCookie.components(separatedBy: ";")
@@ -569,7 +593,7 @@ class UsageManager: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("sessionKey=\(sessionCookie)", forHTTPHeaderField: "Cookie")
+        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
@@ -590,7 +614,7 @@ class UsageManager: ObservableObject {
     func fetchUsage() {
         guard !sessionCookie.isEmpty else {
             DispatchQueue.main.async {
-                self.errorMessage = "Session cookie not set"
+                self.errorMessage = "Not logged in"
                 self.updateStatusBar()
             }
             return
@@ -793,6 +817,10 @@ class UsageManager: ObservableObject {
 
                 if httpResponse.statusCode == 200, let data = data {
                     self?.parseUsageData(data)
+                } else if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                    // session expired, the login button shows again
+                    self?.hasFetchedData = false
+                    self?.errorMessage = "Logged out. Log in again."
                 } else {
                     self?.errorMessage = "HTTP \(httpResponse.statusCode)"
                 }
@@ -1441,137 +1469,112 @@ class UpdateManager: ObservableObject {
 }
 
 // Custom NSTextField that properly handles paste
-class CustomTextField: NSTextField {
-    var onTextChange: ((String) -> Void)?
-
+// Login window: the real claude.ai sign-in page. Once it sets the session
+// cookies we copy them out, so nobody has to dig through dev tools.
+class LoginWebView: WKWebView {
+    // menu bar app has no Edit menu, so cmd+c/v/x/a do nothing without this
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.type == .keyDown {
-            if (event.modifierFlags.contains(.command)) {
-                switch event.charactersIgnoringModifiers {
-                case "v":
-                    if let string = NSPasteboard.general.string(forType: .string) {
-                        self.stringValue = string
-                        onTextChange?(string)
-                        NSLog("ClaudeUsage: Pasted text length: \(string.count)")
-                        return true
-                    }
-                case "a":
-                    self.currentEditor()?.selectAll(nil)
-                    return true
-                case "c":
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(self.stringValue, forType: .string)
-                    return true
-                case "x":
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(self.stringValue, forType: .string)
-                    self.stringValue = ""
-                    onTextChange?("")
-                    return true
-                default:
-                    break
-                }
-            }
-        }
-        return super.performKeyEquivalent(with: event)
-    }
-
-    override func textDidChange(_ notification: Notification) {
-        super.textDidChange(notification)
-        onTextChange?(self.stringValue)
-    }
-}
-
-// Custom TextView that ensures keyboard commands work
-class PasteableNSTextView: NSTextView {
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.modifierFlags.contains(.command) {
+        if event.type == .keyDown, event.modifierFlags.contains(.command) {
+            var sel: Selector?
             switch event.charactersIgnoringModifiers {
-            case "v": // Paste
-                paste(nil)
+            case "v": sel = #selector(NSText.paste(_:))
+            case "c": sel = #selector(NSText.copy(_:))
+            case "x": sel = #selector(NSText.cut(_:))
+            case "a": sel = #selector(NSText.selectAll(_:))
+            case "z": sel = Selector(("undo:"))
+            case "w":
+                window?.performClose(nil)
                 return true
-            case "c": // Copy
-                copy(nil)
-                return true
-            case "x": // Cut
-                cut(nil)
-                return true
-            case "a": // Select All
-                selectAll(nil)
-                return true
-            default:
-                break
+            default: break
             }
+            if let sel = sel, NSApp.sendAction(sel, to: nil, from: self) { return true }
         }
         return super.performKeyEquivalent(with: event)
     }
 }
 
-// Multi-line text field with proper paste support
-struct PasteableTextField: NSViewRepresentable {
-    @Binding var text: String
-    var placeholder: String
+class ClaudeLoginWindow: NSObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver, NSWindowDelegate {
+    private let window: NSWindow
+    private let webView: LoginWebView
+    private let onDone: (String?) -> Void
+    private var finished = false
 
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
-        let textView = PasteableNSTextView()
+    private var cookieStore: WKHTTPCookieStore { webView.configuration.websiteDataStore.httpCookieStore }
 
-        textView.isEditable = true
-        textView.isSelectable = true
-        textView.font = NSFont.systemFont(ofSize: 11)
-        textView.textColor = .labelColor
-        textView.backgroundColor = .textBackgroundColor
-        textView.drawsBackground = true
-        textView.isRichText = false
-        textView.delegate = context.coordinator
-        textView.textContainerInset = NSSize(width: 4, height: 4)
-        textView.isAutomaticQuoteSubstitutionEnabled = false
-        textView.isAutomaticDashSubstitutionEnabled = false
-        textView.isAutomaticTextReplacementEnabled = false
-        textView.usesFindBar = false
-        textView.isGrammarCheckingEnabled = false
-        textView.allowsUndo = true
+    init(onDone: @escaping (String?) -> Void) {
+        self.onDone = onDone
 
-        // Enable wrapping
-        textView.isHorizontallyResizable = false
-        textView.isVerticallyResizable = true
-        textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .default() // persists, so the next login is instant
+        webView = LoginWebView(frame: NSRect(x: 0, y: 0, width: 480, height: 700), configuration: config)
+        // plain safari ua, google sign-in blocks browsers it doesn't recognize
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 
-        scrollView.documentView = textView
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
-        scrollView.autohidesScrollers = true
-        scrollView.borderType = .bezelBorder
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 700),
+                          styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                          backing: .buffered, defer: false)
+        window.title = "Log in to Claude"
+        window.contentView = webView
+        window.isReleasedWhenClosed = false
+        window.center()
 
-        return scrollView
+        super.init()
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        window.delegate = self
+        cookieStore.add(self)
+
+        webView.load(URLRequest(url: URL(string: "https://claude.ai/login")!))
     }
 
-    func updateNSView(_ nsView: NSScrollView, context: Context) {
-        guard let textView = nsView.documentView as? PasteableNSTextView else { return }
-        if textView.string != text {
-            textView.string = text
+    func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) { check(closing: false) }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { check(closing: false) }
+
+    // sign-in popups (google, apple) just load in this same window
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        webView.load(navigationAction.request)
+        return nil
+    }
+
+    func windowWillClose(_ notification: Notification) { check(closing: true) }
+
+    private func check(closing: Bool) {
+        guard !finished else { return }
+        cookieStore.getAllCookies { [weak self] cookies in
+            guard let self = self, !self.finished else { return }
+
+            var jar: [String: String] = [:]
+            for c in cookies where c.domain.hasSuffix("claude.ai") {
+                if let exp = c.expiresDate, exp < Date() { continue }
+                jar[c.name] = c.value
+            }
+            // wait for lastActiveOrg too, claude.ai sets it once the chat page loads
+            let ready = jar["sessionKey"] != nil && jar["lastActiveOrg"] != nil
+            guard ready || closing else { return }
+
+            self.finished = true
+            self.cookieStore.remove(self)
+            let header = jar["sessionKey"] == nil ? nil : jar.map { "\($0.key)=\($0.value)" }.joined(separator: "; ")
+            NSLog("ClaudeUsage: login window done, got session: \(header != nil)")
+            self.onDone(header)
+            if !closing { self.window.close() }
         }
     }
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(self)
-    }
-
-    class Coordinator: NSObject, NSTextViewDelegate {
-        var parent: PasteableTextField
-
-        init(_ parent: PasteableTextField) {
-            self.parent = parent
-        }
-
-        func textDidChange(_ notification: Notification) {
-            guard let textView = notification.object as? NSTextView else { return }
-            parent.text = textView.string
-        }
+    // forget the claude.ai login so a different account can sign in
+    static func clearWebData() {
+        let store = WKWebsiteDataStore.default()
+        store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {}
     }
 }
+
 
 private struct ContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
@@ -1584,8 +1587,6 @@ struct UsageView: View {
     @ObservedObject var usageManager: UsageManager
     @ObservedObject var statusManager: StatusManager
     @ObservedObject var updateManager: UpdateManager
-    @State private var sessionCookieInput: String = ""
-    @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
     @State private var measuredHeight: CGFloat = 250
@@ -1621,9 +1622,6 @@ struct UsageView: View {
                 measuredHeight = value
             }
             .onAppear {
-                if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-                    sessionCookieInput = String(savedCookie.prefix(20)) + "..."
-                }
                 usageManager.updatePercentages()
             }
             .onChange(of: showingSettings) { isOpen in
@@ -1730,7 +1728,7 @@ struct UsageView: View {
 
             // Only show usage if data has been fetched
             if !usageManager.hasFetchedData {
-                Text("👋 Welcome! Set your session cookie below to get started.")
+                Text("Log in with your Claude account to see your usage.")
                     .font(.subheadline)
                     .foregroundColor(Color.secondaryText)
                     .padding(.vertical, 8)
@@ -2071,78 +2069,18 @@ struct UsageView: View {
             }
             }
 
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
-                showingCookieInput.toggle()
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-
-            if showingCookieInput {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("How to get your session cookie:")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Button(action: {
-                            NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
-                        }) {
-                            Text("View tutorial →")
-                                .font(.caption2)
-                                .foregroundColor(.blue)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("1. Go to Settings > Usage on claude.ai")
-                        Text("2. Press F12 (or Cmd+Option+I)")
-                        Text("3. Go to Network tab")
-                        Text("4. Refresh page, click 'usage' request")
-                        Text("5. Find 'Cookie' in Request Headers")
-                        Text("6. Copy full cookie value\n   (starts with anthropic-device-id=...)")
-                    }
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Paste full cookie string:")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                        VStack(spacing: 4) {
-                            PasteableTextField(text: $sessionCookieInput, placeholder: "Paste cookie here...")
-                                .frame(height: 60)
-                                .cornerRadius(4)
-
-                            HStack(spacing: 8) {
-                                Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
-                                    if sessionCookieInput.isEmpty {
-                                        usageManager.errorMessage = "Cookie field is empty!"
-                                    } else {
-                                        usageManager.saveSessionCookie(sessionCookieInput)
-                                        usageManager.fetchUsage()
-                                        usageManager.errorMessage = "Cookie saved, fetching..."
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-
-                                if usageManager.hasFetchedData {
-                                    Button("Clear Cookie") {
-                                        sessionCookieInput = ""
-                                        usageManager.clearSessionCookie()
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                                }
-                            }
-                        }
-                    }
+            if usageManager.hasFetchedData {
+                Button("Log out") {
+                    usageManager.logOut()
                 }
-                .padding(8)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
+                .buttonStyle(.borderless)
+                .font(.caption)
+            } else {
+                Button("Log in with Claude") {
+                    usageManager.logIn()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             }
 
             // Support Section
