@@ -1314,6 +1314,8 @@ class UpdateManager: ObservableObject {
     }
 
     func fetch() {
+        // off: upstream releases would swap this build back to the cookie-paste version
+        return
         let request = URLRequest(url: endpoint, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
         URLSession.shared.dataTask(with: request) { [weak self] data, _, _ in
             guard let self = self,
