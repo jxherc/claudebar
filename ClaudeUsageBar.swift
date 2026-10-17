@@ -72,11 +72,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Initial guess; SwiftUI's intrinsic size (capped at 600) will drive the actual size.
         popover.contentSize = NSSize(width: 360, height: 320)
         popover.behavior = .transient
-        popover.contentViewController = NSHostingController(rootView: UsageView(
+        let host = NSHostingController(rootView: UsageView(
             usageManager: usageManager,
             statusManager: statusManager,
             updateManager: updateManager
         ))
+        // without this the popover stays at 320 tall and the extra height pokes out above the screen
+        if #available(macOS 13.0, *) {
+            host.sizingOptions = [.preferredContentSize]
+        }
+        popover.contentViewController = host
 
         // Appearance preference: "system" (default) tracks the macOS light/dark
         // setting; "dark"/"light" force one (dark was hard-forced in v1.3.2 and
