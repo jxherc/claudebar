@@ -43,7 +43,6 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     ClaudeUsageBar.swift \
     -framework SwiftUI \
     -framework AppKit \
-    -framework WebKit \
     -target arm64-apple-macos12.0
 
 # Compile for x86_64 (Intel)
@@ -51,7 +50,6 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     ClaudeUsageBar.swift \
     -framework SwiftUI \
     -framework AppKit \
-    -framework WebKit \
     -target x86_64-apple-macos12.0
 
 # Create universal binary

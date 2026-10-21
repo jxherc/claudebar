@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import WebKit
 import Carbon
 import ServiceManagement
 
@@ -422,26 +421,20 @@ class UsageManager: ObservableObject {
     @Published var shortcutEnabled: Bool = true
 
     private var statusItem: NSStatusItem?
-    private var sessionCookie: String = ""
     private weak var delegate: AppDelegate?
     private var lastNotifiedThreshold: Int = 0
 
     init(statusItem: NSStatusItem?, delegate: AppDelegate? = nil) {
         self.statusItem = statusItem
         self.delegate = delegate
-        loadSessionCookie()
+        // old builds saved claude.ai cookies here, nothing reads them anymore
+        UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
         loadSettings()
         checkAccessibilityStatus()
     }
 
     func checkAccessibilityStatus() {
         isAccessibilityEnabled = AXIsProcessTrusted()
-    }
-
-    func loadSessionCookie() {
-        if let savedCookie = UserDefaults.standard.string(forKey: "claude_session_cookie") {
-            sessionCookie = savedCookie
-        }
     }
 
     func loadSettings() {
@@ -510,167 +503,92 @@ class UsageManager: ObservableObject {
         }
     }
 
-    func saveSessionCookie(_ cookie: String) {
-        NSLog("ClaudeUsage: Saving cookie, length: \(cookie.count)")
-        sessionCookie = cookie
-        UserDefaults.standard.set(cookie, forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-        NSLog("ClaudeUsage: Cookie saved successfully")
-    }
-
-    func clearSessionCookie() {
-        NSLog("ClaudeUsage: Clearing cookie")
-        sessionCookie = ""
-        UserDefaults.standard.removeObject(forKey: "claude_session_cookie")
-        UserDefaults.standard.synchronize()
-
-        // Reset all data
-        sessionUsage = 0
-        weeklyUsage = 0
-        weeklySonnetUsage = 0
-        weeklyFableUsage = 0
-        sessionResetsAt = nil
-        weeklyResetsAt = nil
-        weeklySonnetResetsAt = nil
-        weeklyFableResetsAt = nil
-        extraSpentMinor = 0
-        extraLimitMinor = 0
-        extraResetsAt = nil
-        freeCreditsMinor = 0
-        limitResetsLeft = 0
-        limitResetsEndAt = nil
-        hasCreditUsage = false
-        hasFetchedData = false
-        hasWeeklySonnet = false
-        hasWeeklyFable = false
-        errorMessage = nil
-        lastNotifiedThreshold = 0
-        UserDefaults.standard.set(0, forKey: "last_notified_threshold")
-
-        // Update status bar to show 0%
-        delegate?.updateStatusIcon(percentage: 0)
-
-        NSLog("ClaudeUsage: Cookie cleared, data reset")
-    }
-
-    private var loginWindow: ClaudeLoginWindow?
-
-    func logIn() {
-        delegate?.closePopover()
-        if let w = loginWindow {
-            w.show()
-            return
-        }
-        loginWindow = ClaudeLoginWindow { [weak self] cookie in
-            DispatchQueue.main.async {
-                self?.loginWindow = nil
-                guard let cookie = cookie else { return }
-                self?.saveSessionCookie(cookie)
-                self?.fetchUsage()
-            }
-        }
-        loginWindow?.show()
-    }
-
-    func logOut() {
-        clearSessionCookie()
-        ClaudeLoginWindow.clearWebData()
-    }
-
-    func fetchOrganizationId(completion: @escaping (String?) -> Void) {
-        // Get org ID from the lastActiveOrg cookie value
-        let cookieParts = sessionCookie.components(separatedBy: ";")
-        for part in cookieParts {
-            let trimmed = part.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("lastActiveOrg=") {
-                let orgId = trimmed.replacingOccurrences(of: "lastActiveOrg=", with: "")
-                NSLog("📋 Found org ID in cookie: \(orgId)")
-                completion(orgId)
-                return
-            }
-        }
-
-        // If not in cookie, fetch from bootstrap
-        guard let url = URL(string: "https://claude.ai/api/bootstrap") else {
-            completion(nil)
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-
-        NSLog("📡 Fetching bootstrap to get org ID...")
-
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let account = json["account"] as? [String: Any],
-                  let lastActiveOrgId = account["lastActiveOrgId"] as? String else {
-                NSLog("❌ Could not parse org ID from bootstrap")
-                completion(nil)
-                return
-            }
-            NSLog("✅ Got org ID from bootstrap: \(lastActiveOrgId)")
-            completion(lastActiveOrgId)
-        }.resume()
-    }
-
+    // usage comes from claude code's login, via api.anthropic.com. claude.ai's own api
+    // now sits behind a cloudflare "verify you are human" check, so cookies stopped working
     func fetchUsage() {
-        guard !sessionCookie.isEmpty else {
-            DispatchQueue.main.async {
-                self.errorMessage = "Not logged in"
-                self.updateStatusBar()
-            }
-            return
-        }
-
         isLoading = true
         errorMessage = nil
-
-        // Extract org ID from cookie
-        fetchOrganizationId { [weak self] orgId in
-            guard let self = self, let orgId = orgId else {
-                DispatchQueue.main.async {
-                    self?.errorMessage = "Could not get org ID from cookie"
-                    self?.isLoading = false
+        DispatchQueue.global().async {
+            let token = Self.claudeCodeToken()
+            DispatchQueue.main.async {
+                guard let token = token else {
+                    self.isLoading = false
+                    self.hasFetchedData = false
+                    self.errorMessage = "Sign in to Claude Code first (run claude in a terminal)."
+                    self.updateStatusBar()
+                    return
                 }
-                return
+                self.fetchOAuthUsage(token)
             }
-
-            self.fetchUsageWithOrgId(orgId)
-            self.fetchExtraUsage(orgId)
-            self.fetchFreeCredits(orgId)
-            self.fetchLimitResets(orgId)
         }
     }
 
-    // Usage-limit resets the account can still use. claude.ai's Settings > Usage reads
-    // the same `cedar_ember` object from /usage with `cedar_ember=1`; we only GET it.
-    func fetchLimitResets(_ orgId: String) {
-        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/usage?cedar_ember=1&skip_spend=1") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
+    // claude code keeps its login in the keychain. going through /usr/bin/security
+    // skips the keychain prompt, that tool already has access to the item
+    static func claudeCodeToken() -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        guard (try? p.run()) != nil else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String else { return nil }
+        return token
+    }
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+    func fetchOAuthUsage(_ token: String) {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             DispatchQueue.main.async {
-                guard let self = self,
-                      let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let data = data,
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-                let (left, endAt) = Self.parseLimitResets(json["cedar_ember"])
-                self.limitResetsLeft = left
-                self.limitResetsEndAt = endAt
-                NSLog("🔄 Limit resets available: \(left)")
+                guard let self = self else { return }
+                self.isLoading = false
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                NSLog("📡 Status: \(code)")
+
+                if let error = error {
+                    NSLog("❌ Error: \(error.localizedDescription)")
+                    self.errorMessage = "Network error"
+                } else if code == 401 {
+                    // token ran out and claude code hasn't renewed it yet
+                    self.hasFetchedData = false
+                    self.errorMessage = "Claude Code login expired. Open Claude Code to refresh it."
+                } else if code == 200, let data = data {
+                    self.parseUsageData(data)
+                    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        self.parseExtras(json)
+                    }
+                } else {
+                    self.errorMessage = "HTTP \(code)"
+                }
+                self.updateStatusBar()
             }
         }.resume()
+    }
+
+    // usage-limit resets and extra usage spend come in the same response
+    func parseExtras(_ json: [String: Any]) {
+        let (left, endAt) = Self.parseLimitResets(json["cedar_ember"])
+        limitResetsLeft = left
+        limitResetsEndAt = endAt
+
+        let spend = json["spend"] as? [String: Any]
+        let used = spend?["used"] as? [String: Any]
+        let limit = spend?["limit"] as? [String: Any]
+        extraSpentMinor = (used?["amount_minor"] as? Int) ?? 0
+        extraLimitMinor = (limit?["amount_minor"] as? Int) ?? 0
+        creditCurrency = (used?["currency"] as? String) ?? "USD"
+        hasCreditUsage = extraSpentMinor > 0
+        NSLog("💳 Extra usage: \(extraSpentMinor)/\(extraLimitMinor) \(creditCurrency), resets left: \(left)")
     }
 
     /// Counts resets still usable across grants (not paused, inside their window)
@@ -697,142 +615,6 @@ class UsageManager: ObservableObject {
             earliestEnd = min(earliestEnd ?? end, end)
         }
         return (total, earliestEnd)
-    }
-
-    // Remaining free/promo credits (balance) from /prepaid/credits.
-    func fetchFreeCredits(_ orgId: String) {
-        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/prepaid/credits") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            DispatchQueue.main.async {
-                guard let self = self,
-                      let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let data = data,
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-                // `amount` is the current balance; fall back to summing remaining tranches.
-                if let amount = json["amount"] as? Int {
-                    self.freeCreditsMinor = amount
-                } else {
-                    var remaining = 0
-                    for key in ["tranches", "promo_tranches"] {
-                        if let arr = json[key] as? [[String: Any]] {
-                            for t in arr { remaining += (t["remaining_amount_minor_units"] as? Int) ?? 0 }
-                        }
-                    }
-                    self.freeCreditsMinor = remaining
-                }
-                if let cur = json["currency"] as? String { self.creditCurrency = cur }
-                NSLog("🎁 Free credits left: \(self.freeCreditsMinor) \(self.creditCurrency)")
-            }
-        }.resume()
-    }
-
-    // Extra usage spend + monthly limit live on a separate endpoint (not /usage).
-    func fetchExtraUsage(_ orgId: String) {
-        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/overage_spend_limit") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            DispatchQueue.main.async {
-                guard let self = self,
-                      let http = response as? HTTPURLResponse, http.statusCode == 200,
-                      let data = data,
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-
-                let spent = (json["used_credits"] as? Int) ?? 0
-                let limit = (json["monthly_credit_limit"] as? Int) ?? 0
-                self.extraSpentMinor = spent
-                self.extraLimitMinor = limit
-                self.creditCurrency = (json["currency"] as? String) ?? "USD"
-                if let resetStr = json["disabled_until"] as? String {
-                    let f = ISO8601DateFormatter()
-                    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                    self.extraResetsAt = f.date(from: resetStr) ?? ISO8601DateFormatter().date(from: resetStr)
-                }
-                self.hasCreditUsage = spent > 0
-                NSLog("💳 Extra usage: \(spent)/\(limit) \(self.creditCurrency)")
-            }
-        }.resume()
-    }
-
-    func fetchUsageWithOrgId(_ orgId: String) {
-        let urlString = "https://claude.ai/api/organizations/\(orgId)/usage"
-
-        guard let url = URL(string: urlString) else {
-            DispatchQueue.main.async {
-                self.errorMessage = "Invalid URL"
-                self.isLoading = false
-            }
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-
-        // Use the full cookie string (user provides all cookies, not just sessionKey)
-        request.setValue(sessionCookie, forHTTPHeaderField: "Cookie")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
-        request.setValue("https://claude.ai", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("claude.ai", forHTTPHeaderField: "authority")
-
-        NSLog("🔍 Fetching from: \(urlString)")
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            DispatchQueue.main.async {
-                self?.isLoading = false
-
-                if let error = error {
-                    NSLog("❌ Error: \(error.localizedDescription)")
-                    self?.errorMessage = "Network error"
-                    self?.updateStatusBar()
-                    return
-                }
-
-                guard let httpResponse = response as? HTTPURLResponse else {
-                    self?.errorMessage = "Invalid response"
-                    self?.updateStatusBar()
-                    return
-                }
-
-                NSLog("📡 Status: \(httpResponse.statusCode)")
-
-                if let data = data, let responseString = String(data: data, encoding: .utf8) {
-                    NSLog("📦 Response: \(responseString)")
-                }
-
-                if httpResponse.statusCode == 200, let data = data {
-                    self?.parseUsageData(data)
-                } else if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
-                    // session expired, the login button shows again
-                    self?.hasFetchedData = false
-                    self?.errorMessage = "Logged out. Log in again."
-                } else {
-                    self?.errorMessage = "HTTP \(httpResponse.statusCode)"
-                }
-
-                self?.updateStatusBar()
-            }
-        }.resume()
     }
 
     func parseUsageData(_ data: Data) {
@@ -1475,114 +1257,6 @@ class UpdateManager: ObservableObject {
     }
 }
 
-// Custom NSTextField that properly handles paste
-// Login window: the real claude.ai sign-in page. Once it sets the session
-// cookies we copy them out, so nobody has to dig through dev tools.
-class LoginWebView: WKWebView {
-    // menu bar app has no Edit menu, so cmd+c/v/x/a do nothing without this
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.type == .keyDown, event.modifierFlags.contains(.command) {
-            var sel: Selector?
-            switch event.charactersIgnoringModifiers {
-            case "v": sel = #selector(NSText.paste(_:))
-            case "c": sel = #selector(NSText.copy(_:))
-            case "x": sel = #selector(NSText.cut(_:))
-            case "a": sel = #selector(NSText.selectAll(_:))
-            case "z": sel = Selector(("undo:"))
-            case "w":
-                window?.performClose(nil)
-                return true
-            default: break
-            }
-            if let sel = sel, NSApp.sendAction(sel, to: nil, from: self) { return true }
-        }
-        return super.performKeyEquivalent(with: event)
-    }
-}
-
-class ClaudeLoginWindow: NSObject, WKNavigationDelegate, WKUIDelegate, WKHTTPCookieStoreObserver, NSWindowDelegate {
-    private let window: NSWindow
-    private let webView: LoginWebView
-    private let onDone: (String?) -> Void
-    private var finished = false
-
-    private var cookieStore: WKHTTPCookieStore { webView.configuration.websiteDataStore.httpCookieStore }
-
-    init(onDone: @escaping (String?) -> Void) {
-        self.onDone = onDone
-
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default() // persists, so the next login is instant
-        webView = LoginWebView(frame: NSRect(x: 0, y: 0, width: 480, height: 700), configuration: config)
-        // plain safari ua, google sign-in blocks browsers it doesn't recognize
-        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
-
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 700),
-                          styleMask: [.titled, .closable, .resizable, .miniaturizable],
-                          backing: .buffered, defer: false)
-        window.title = "Log in to Claude"
-        window.contentView = webView
-        window.isReleasedWhenClosed = false
-        window.center()
-
-        super.init()
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        window.delegate = self
-        cookieStore.add(self)
-
-        webView.load(URLRequest(url: URL(string: "https://claude.ai/login")!))
-    }
-
-    func show() {
-        NSApp.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
-    }
-
-    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) { check(closing: false) }
-
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { check(closing: false) }
-
-    // sign-in popups (google, apple) just load in this same window
-    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
-                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        webView.load(navigationAction.request)
-        return nil
-    }
-
-    func windowWillClose(_ notification: Notification) { check(closing: true) }
-
-    private func check(closing: Bool) {
-        guard !finished else { return }
-        cookieStore.getAllCookies { [weak self] cookies in
-            guard let self = self, !self.finished else { return }
-
-            var jar: [String: String] = [:]
-            for c in cookies where c.domain.hasSuffix("claude.ai") {
-                if let exp = c.expiresDate, exp < Date() { continue }
-                jar[c.name] = c.value
-            }
-            // wait for lastActiveOrg too, claude.ai sets it once the chat page loads
-            let ready = jar["sessionKey"] != nil && jar["lastActiveOrg"] != nil
-            guard ready || closing else { return }
-
-            self.finished = true
-            self.cookieStore.remove(self)
-            let header = jar["sessionKey"] == nil ? nil : jar.map { "\($0.key)=\($0.value)" }.joined(separator: "; ")
-            NSLog("ClaudeUsage: login window done, got session: \(header != nil)")
-            self.onDone(header)
-            if !closing { self.window.close() }
-        }
-    }
-
-    // forget the claude.ai login so a different account can sign in
-    static func clearWebData() {
-        let store = WKWebsiteDataStore.default()
-        store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {}
-    }
-}
-
-
 private struct ContentHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -1735,7 +1409,7 @@ struct UsageView: View {
 
             // Only show usage if data has been fetched
             if !usageManager.hasFetchedData {
-                Text("Log in with your Claude account to see your usage.")
+                Text("Shows usage for the account Claude Code is signed into.")
                     .font(.subheadline)
                     .foregroundColor(Color.secondaryText)
                     .padding(.vertical, 8)
@@ -2076,15 +1750,9 @@ struct UsageView: View {
             }
             }
 
-            if usageManager.hasFetchedData {
-                Button("Log out") {
-                    usageManager.logOut()
-                }
-                .buttonStyle(.borderless)
-                .font(.caption)
-            } else {
-                Button("Log in with Claude") {
-                    usageManager.logIn()
+            if !usageManager.hasFetchedData {
+                Button("Try again") {
+                    usageManager.fetchUsage()
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)

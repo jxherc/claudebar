@@ -1,8 +1,8 @@
 # ClaudeUsageBar
 
-macOS menu bar app that shows your Claude usage limits, with a real "Log in with Claude" button instead of pasting session cookies out of dev tools.
+macOS menu bar app that shows your Claude usage limits. no cookies to paste and no login window: it reads the login Claude Code already has.
 
-click the menu bar icon, hit **Log in with Claude**, and sign in on the normal claude.ai page. the window closes by itself once it has your session. **Log out** clears it so you can switch accounts.
+if Claude Code is signed in on your Mac, the app just works. if it isn't, run `claude` in a terminal and sign in, then hit **Try again** in the popup. it shows the account Claude Code is signed into.
 
 ## credit
 
@@ -10,10 +10,12 @@ this is a modified copy of [ClaudeUsageBar](https://github.com/Artzainnn/ClaudeU
 
 what's different here:
 
-- built-in claude.ai login window replaces the cookie paste box
-- an expired session shows the login button again instead of a bare http error
+- usage comes from `api.anthropic.com` with Claude Code's login, read from the keychain through `/usr/bin/security`. claude.ai's api now puts a cloudflare "verify you are human" check in front of apps, so the cookie way stopped working (upstream issue [#112](https://github.com/Artzainnn/ClaudeUsageBar/issues/112))
+- the free credits line is gone, that number only came from claude.ai
 - upstream update check is off, since installing an upstream release would swap this back to the cookie version
 - popup sizes itself correctly when built on the macOS 27 SDK (the top used to get cut off)
+
+Claude Code's login token lasts a few hours and Claude Code renews it when you use it. if you haven't used Claude Code in a while, the app says the login expired until you open it again.
 
 if you just want the original, get it from their repo or site.
 
